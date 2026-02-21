@@ -43,7 +43,7 @@ function base64UrlDecode(input: string): string {
 
 function isAllowedUpstreamHost(hostname: string): boolean {
   const h = hostname.toLowerCase();
-  return h === "assets.grok.com" || h === "grok.com" || h.endsWith(".grok.com");
+  return h === "assets.grok.com" || h === "grok.com" || h.endsWith(".grok.com") || h.endsWith(".x.ai");
 }
 
 function isUuid(s: string): boolean {
@@ -207,7 +207,7 @@ mediaRoutes.get("/images/:imgPath{.+}", async (c) => {
   c.executionCtx.waitUntil(deleteCacheRow(c.env.DB, key));
 
   const settingsBundle = await getSettings(c.env);
-  const chosen = await selectBestToken(c.env.DB, "grok-4-fast");
+  const chosen = await selectBestToken(c.env.DB, "grok-4");
   if (!chosen) return c.text("No available token", 503);
 
   const cf = normalizeCfCookie(settingsBundle.grok.cf_clearance ?? "");

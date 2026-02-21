@@ -1,10 +1,23 @@
-const STORAGE_KEY = 'grok2api_user_api_key';
+﻿const STORAGE_KEY = 'grok2api_user_api_key';
 
 let currentTab = 'chat';
 let models = [];
 let chatMessages = [];
 let chatAttachments = []; // { file, previewUrl }
 let videoAttachments = [];
+let imageGenerationMethod = 'legacy';
+let imageGenerationExperimental = false;
+let imageContinuousSockets = [];
+let imageContinuousRunning = false;
+let imageContinuousCount = 0;
+let imageContinuousLatencyTotal = 0;
+let imageContinuousLatencyCount = 0;
+let imageContinuousActive = 0;
+let imageContinuousLastError = '';
+let imageContinuousRunToken = 0;
+let imageContinuousDesiredConcurrency = 1;
+const PREFERRED_CHAT_MODEL = 'grok-4.20-beta';
+let chatSending = false;
 
 function q(id) {
   return document.getElementById(id);
@@ -57,6 +70,8 @@ function detectBase64ImageMime(base64Text) {
 function toImageDataUrl(raw) {
   const value = String(raw || '').trim();
   if (!value) return '';
+  const lowered = value.toLowerCase();
+  if (['error', 'null', 'none', 'undefined'].includes(lowered)) return '';
   if (value.startsWith('data:image/')) return value;
   const mime = detectBase64ImageMime(value);
   return `data:${mime};base64,${value}`;
@@ -64,7 +79,15 @@ function toImageDataUrl(raw) {
 
 function pickImageSrc(item) {
   const rawUrl = String(item?.url || '').trim();
-  if (rawUrl && rawUrl !== 'https://assets.grok.com/' && rawUrl !== 'https://assets.grok.com') {
+  const rawUrlLower = rawUrl.toLowerCase();
+  if (
+    rawUrl &&
+    rawUrl !== 'https://assets.grok.com/' &&
+    rawUrl !== 'https://assets.grok.com' &&
+    rawUrlLower !== 'error' &&
+    rawUrlLower !== 'null' &&
+    rawUrlLower !== 'undefined'
+  ) {
     return toAbsoluteUrl(rawUrl);
   }
   const b64json = String(item?.b64_json || '').trim();
@@ -86,6 +109,108 @@ function showUserMsg(role, content) {
   q('chat-messages').appendChild(wrap);
   q('chat-messages').scrollTop = q('chat-messages').scrollHeight;
   return bubble;
+}
+
+function setChatSendingState(sending) {
+  chatSending = Boolean(sending);
+  const sendBtn = q('panel-chat')?.querySelector('button[onclick="sendChat()"]');
+  if (sendBtn) sendBtn.disabled = chatSending;
+  document.querySelectorAll('.chat-retry-btn').forEach((btn) => {
+    btn.disabled = chatSending;
+  });
+}
+
+function appendCacheBust(url) {
+  const raw = String(url || '').trim();
+  if (!raw || raw.startsWith('data:')) return raw;
+  try {
+    const parsed = new URL(raw, window.location.href);
+    parsed.searchParams.set('_retry', String(Date.now()));
+    return parsed.toString();
+  } catch (e) {
+    const sep = raw.includes('?') ? '&' : '?';
+    return `${raw}${sep}_retry=${Date.now()}`;
+  }
+}
+
+function retryImageFromButton(button) {
+  const src = String(button?.dataset?.src || '').trim();
+  const alt = String(button?.dataset?.alt || 'image').trim() || 'image';
+  if (!src || button.classList.contains('loading')) return;
+
+  button.classList.add('loading');
+  button.textContent = '重试中...';
+
+  const probe = new Image();
+  probe.onload = () => {
+    const img = document.createElement('img');
+    img.alt = alt;
+    img.src = probe.src;
+    bindRetryableImage(img);
+    button.replaceWith(img);
+  };
+  probe.onerror = () => {
+    button.classList.remove('loading');
+    button.textContent = '点击重试';
+  };
+  probe.src = appendCacheBust(src);
+}
+
+function bindRetryableImage(img) {
+  if (!img || img.dataset.retryBound === '1') return;
+  img.dataset.retryBound = '1';
+  img.addEventListener('error', () => {
+    const src = String(img.currentSrc || img.getAttribute('src') || '').trim();
+    if (!src || !img.isConnected) return;
+    const retryBtn = document.createElement('button');
+    retryBtn.type = 'button';
+    retryBtn.className = 'img-retry';
+    retryBtn.textContent = '点击重试';
+    retryBtn.title = '图片加载失败，点击重试';
+    retryBtn.dataset.src = src;
+    retryBtn.dataset.alt = String(img.alt || 'image');
+    retryBtn.addEventListener('click', () => retryImageFromButton(retryBtn));
+    img.replaceWith(retryBtn);
+  });
+}
+
+function bindRetryableImages(root) {
+  if (!root) return;
+  root.querySelectorAll('img').forEach((img) => bindRetryableImage(img));
+}
+
+function attachAssistantRetryAction(bubbleEl) {
+  if (!bubbleEl || bubbleEl.querySelector('.msg-actions')) return;
+  const actions = document.createElement('div');
+  actions.className = 'msg-actions';
+  const retryBtn = document.createElement('button');
+  retryBtn.type = 'button';
+  retryBtn.className = 'chat-retry-btn';
+  retryBtn.textContent = '重试上一条回答';
+  retryBtn.title = '重试上一条回答';
+  retryBtn.disabled = chatSending;
+  retryBtn.addEventListener('click', retryLastAssistantAnswer);
+  actions.appendChild(retryBtn);
+  bubbleEl.appendChild(actions);
+}
+
+function findLastUserMessageIndex(messages) {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    if (messages[i]?.role === 'user') return i;
+  }
+  return -1;
+}
+
+function getSelectedChatModel() {
+  const sel = q('model-select');
+  const options = Array.from(sel?.options || [])
+    .map((opt) => String(opt.value || '').trim())
+    .filter(Boolean);
+  const current = String(sel?.value || '').trim();
+  if (current && options.includes(current)) return current;
+  const fallback = options.includes(PREFERRED_CHAT_MODEL) ? PREFERRED_CHAT_MODEL : (options[0] || '');
+  if (sel && fallback) sel.value = fallback;
+  return fallback;
 }
 
 function mdImagesToHtml(text) {
@@ -170,6 +295,7 @@ function renderContent(container, content, forceText) {
     return;
   }
   container.innerHTML = html;
+  bindRetryableImages(container);
 }
 
 async function init() {
@@ -194,7 +320,17 @@ async function init() {
   if (!q('api-key-input').value) q('api-key-input').value = saved;
 
   bindFileInputs();
+  q('image-run-mode')?.addEventListener('change', () => {
+    if (getImageRunMode() !== 'continuous') {
+      stopImageContinuous();
+    }
+    updateImageModeUI();
+  });
+  window.addEventListener('beforeunload', () => {
+    stopImageContinuous();
+  });
   await refreshModels();
+  await refreshImageGenerationMethod();
 
   chatMessages = [];
   q('chat-messages').innerHTML = '';
@@ -251,8 +387,419 @@ function renderAttachments(kind) {
   });
 }
 
+function getImageRunMode() {
+  const value = String(q('image-run-mode')?.value || 'single').trim().toLowerCase();
+  return value === 'continuous' ? 'continuous' : 'single';
+}
+
+function getImageContinuousConcurrency() {
+  return Math.max(1, Math.min(3, Math.floor(Number(q('image-concurrency')?.value || 1) || 1)));
+}
+
+function getImageContinuousActiveCount() {
+  return imageContinuousSockets.filter((it) => it && it.active && !it.closed).length;
+}
+
+function getImageContinuousOpenCount() {
+  return imageContinuousSockets.filter((it) => {
+    const ws = it?.ws;
+    if (!ws || it?.closed) return false;
+    return ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING;
+  }).length;
+}
+
+function setImageStatusText(text) {
+  const el = q('image-status-text');
+  if (el) el.textContent = String(text || '-');
+}
+
+function updateImageContinuousStats() {
+  imageContinuousActive = getImageContinuousActiveCount();
+  const countEl = q('image-count-value');
+  const activeEl = q('image-active-value');
+  const latencyEl = q('image-latency-value');
+  const errorEl = q('image-error-value');
+  if (countEl) countEl.textContent = String(imageContinuousCount);
+  if (activeEl) activeEl.textContent = String(imageContinuousActive);
+  if (latencyEl) {
+    if (imageContinuousLatencyCount > 0) {
+      latencyEl.textContent = `${Math.round(imageContinuousLatencyTotal / imageContinuousLatencyCount)}ms`;
+    } else {
+      latencyEl.textContent = '-';
+    }
+  }
+  if (errorEl) errorEl.textContent = imageContinuousLastError || '-';
+}
+
+function updateImageContinuousButtons() {
+  const isContinuous = imageGenerationExperimental && getImageRunMode() === 'continuous';
+  const startBtn = q('image-start-btn');
+  const stopBtn = q('image-stop-btn');
+  if (startBtn) startBtn.disabled = !isContinuous || imageContinuousRunning;
+  if (stopBtn) stopBtn.disabled = !isContinuous || !imageContinuousRunning;
+}
+
+function updateImageRunModeUI() {
+  const isContinuous = imageGenerationExperimental && getImageRunMode() === 'continuous';
+  const nWrap = q('image-n-wrap');
+  const generateWrap = q('image-generate-wrap');
+  const resultBox = q('image-results');
+  const continuousWrap = q('image-continuous-wrap');
+  const emptyState = q('image-empty-state');
+  const waterfall = q('image-waterfall');
+
+  if (nWrap) nWrap.classList.toggle('hidden', isContinuous);
+  if (generateWrap) generateWrap.classList.toggle('hidden', isContinuous);
+  if (resultBox) resultBox.classList.toggle('hidden', isContinuous);
+  if (continuousWrap) continuousWrap.classList.toggle('hidden', !isContinuous);
+  if (resultBox) resultBox.classList.remove('waterfall-layout');
+
+  if (emptyState && waterfall) {
+    emptyState.classList.toggle('hidden', waterfall.children.length > 0);
+  }
+
+  if (isContinuous && imageContinuousRunning) {
+    setImageStatusText(imageContinuousActive > 0 ? 'Running' : 'Connecting');
+  } else if (isContinuous) {
+    setImageStatusText('Idle');
+  }
+
+  updateImageContinuousButtons();
+  updateImageContinuousStats();
+}
+
+function updateImageModeUI() {
+  const isExperimental = imageGenerationExperimental;
+  const hint = q('image-mode-hint');
+  const aspectWrap = q('image-aspect-wrap');
+  const concurrencyWrap = q('image-concurrency-wrap');
+  const runModeWrap = q('image-run-mode-wrap');
+  const runMode = q('image-run-mode');
+
+  if (!isExperimental && imageContinuousRunning) {
+    stopImageContinuous();
+  }
+
+  if (hint) hint.classList.toggle('hidden', !isExperimental);
+  if (aspectWrap) aspectWrap.classList.toggle('hidden', !isExperimental);
+  if (concurrencyWrap) concurrencyWrap.classList.toggle('hidden', !isExperimental);
+  if (runModeWrap) runModeWrap.classList.toggle('hidden', !isExperimental);
+  if (runMode && !isExperimental) runMode.value = 'single';
+
+  updateImageRunModeUI();
+}
+
+function clearImageContinuousError() {
+  imageContinuousLastError = '';
+  updateImageContinuousStats();
+}
+
+function setImageContinuousError(message) {
+  imageContinuousLastError = String(message || '').trim() || 'unknown';
+  updateImageContinuousStats();
+}
+
+function resetImageContinuousMetrics(resetCount) {
+  if (resetCount) imageContinuousCount = 0;
+  imageContinuousLatencyTotal = 0;
+  imageContinuousLatencyCount = 0;
+  imageContinuousActive = 0;
+  clearImageContinuousError();
+  updateImageContinuousStats();
+}
+
+function appendWaterfallImage(item, connectionIndex) {
+  const src = pickImageSrc(item);
+  if (!src) return;
+
+  const waterfall = q('image-waterfall');
+  if (!waterfall) return;
+
+  const seq = Number(item?.sequence) || waterfall.children.length + 1;
+  const elapsed = Math.max(0, Number(item?.elapsed_ms) || 0);
+  const ratio = String(item?.aspect_ratio || '').trim();
+
+  const card = document.createElement('div');
+  card.className = 'waterfall-item';
+  card.innerHTML = `
+    <img alt="image" src="${src}" />
+    <div class="waterfall-meta">
+      <span>#${seq} 路 WS${connectionIndex + 1}</span>
+      <span>${ratio || '-'} 路 ${elapsed > 0 ? `${elapsed}ms` : '-'}</span>
+    </div>
+  `;
+  waterfall.prepend(card);
+  bindRetryableImage(card.querySelector('img'));
+
+  imageContinuousCount += 1;
+  if (elapsed > 0) {
+    imageContinuousLatencyTotal += elapsed;
+    imageContinuousLatencyCount += 1;
+  }
+
+  const emptyState = q('image-empty-state');
+  if (emptyState) emptyState.classList.add('hidden');
+  updateImageContinuousStats();
+}
+
+function clearImageWaterfall() {
+  const waterfall = q('image-waterfall');
+  const emptyState = q('image-empty-state');
+  if (waterfall) waterfall.innerHTML = '';
+  if (emptyState) emptyState.classList.remove('hidden');
+  resetImageContinuousMetrics(true);
+}
+
+function buildImagineWsUrl() {
+  const key = getUserApiKey();
+  const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = new URL('/api/v1/admin/imagine/ws', `${proto}//${window.location.host}`);
+  if (key) url.searchParams.set('api_key', key);
+  return url.toString();
+}
+
+function parseWsMessage(raw) {
+  if (!raw) return null;
+  try {
+    return JSON.parse(raw);
+  } catch (e) {
+    return null;
+  }
+}
+
+function openImageContinuousSocket(socketIndex, runToken, prompt, aspectRatio, attempt = 0) {
+  const wsUrl = buildImagineWsUrl();
+  const ws = new WebSocket(wsUrl);
+  const socketState = {
+    index: socketIndex,
+    ws,
+    runToken,
+    attempt,
+    active: false,
+    closed: false,
+    hadError: false,
+    lastError: '',
+    runId: '',
+  };
+  imageContinuousSockets.push(socketState);
+  updateImageContinuousStats();
+
+  ws.onopen = () => {
+    if (!imageContinuousRunning || runToken !== imageContinuousRunToken || getImageRunMode() !== 'continuous') {
+      try { ws.close(1000, 'stale'); } catch (e) {}
+      return;
+    }
+    clearImageContinuousError();
+    ws.send(JSON.stringify({ type: 'start', prompt, aspect_ratio: aspectRatio }));
+  };
+
+  ws.onmessage = (event) => {
+    const data = parseWsMessage(event?.data);
+    if (!data || runToken !== imageContinuousRunToken) return;
+    const msgType = String(data?.type || '').trim();
+
+    if (msgType === 'status') {
+      const status = String(data?.status || '').trim().toLowerCase();
+      socketState.runId = String(data?.run_id || socketState.runId || '');
+      socketState.active = status === 'running';
+      updateImageContinuousStats();
+      if (imageContinuousRunning) {
+        if (status === 'running') {
+          clearImageContinuousError();
+          setImageStatusText('Running');
+        }
+        if (status === 'stopped') setImageStatusText('Stopped');
+      }
+      updateImageContinuousButtons();
+      return;
+    }
+
+    if (msgType === 'image') {
+      socketState.active = true;
+      clearImageContinuousError();
+      appendWaterfallImage(data, socketIndex);
+      if (imageContinuousRunning) setImageStatusText('Running');
+      updateImageContinuousButtons();
+      return;
+    }
+
+    if (msgType === 'error') {
+      const message = String(data?.message || 'unknown error').trim() || 'unknown error';
+      setImageContinuousError(message);
+      if (imageContinuousRunning) setImageStatusText('Running (with errors)');
+      return;
+    }
+
+    if (msgType === 'pong') {
+      if (imageContinuousRunning && imageContinuousActive <= 0) setImageStatusText('Connected');
+    }
+  };
+
+  ws.onerror = () => {
+    if (runToken !== imageContinuousRunToken) return;
+    socketState.hadError = true;
+    socketState.lastError = `WS${socketIndex + 1} connection error`;
+  };
+
+  ws.onclose = (event) => {
+    socketState.closed = true;
+    socketState.active = false;
+    updateImageContinuousStats();
+
+    if (runToken !== imageContinuousRunToken) return;
+    if (imageContinuousRunning) {
+      const stillActive = getImageContinuousActiveCount();
+      const stillOpen = getImageContinuousOpenCount();
+
+      if (event?.code === 1008 && stillActive <= 0 && stillOpen <= 0) {
+        setImageContinuousError('WebSocket auth rejected. Check API key.');
+        setImageStatusText('Auth failed');
+      } else if (socketState.hadError && stillActive <= 0 && stillOpen <= 0) {
+        const closeCode = Number(event?.code || 0);
+        const closeReason = String(event?.reason || '').trim();
+        if (closeCode > 0) {
+          const suffix = closeReason ? `: ${closeReason}` : '';
+          setImageContinuousError(`WebSocket closed (${closeCode})${suffix}`);
+        } else {
+          setImageContinuousError(socketState.lastError || `WS${socketIndex + 1} connection error`);
+        }
+        setImageStatusText('Disconnected');
+      }
+
+      if (
+        event?.code !== 1000 &&
+        event?.code !== 1008 &&
+        socketState.attempt < 1 &&
+        getImageRunMode() === 'continuous' &&
+        imageGenerationExperimental
+      ) {
+        setTimeout(() => {
+          if (!imageContinuousRunning || runToken !== imageContinuousRunToken) return;
+          if (getImageContinuousOpenCount() >= imageContinuousDesiredConcurrency) return;
+          openImageContinuousSocket(socketIndex, runToken, prompt, aspectRatio, socketState.attempt + 1);
+        }, 1200);
+      }
+
+      if (stillActive <= 0 && stillOpen <= 0 && event?.code === 1000) {
+        setImageStatusText('Stopped');
+      }
+      updateImageContinuousButtons();
+    }
+  };
+}
+
+function stopImageContinuous() {
+  imageContinuousRunToken += 1;
+  imageContinuousRunning = false;
+  imageContinuousActive = 0;
+
+  imageContinuousSockets.forEach((state) => {
+    const ws = state?.ws;
+    if (!ws) return;
+    try {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'stop' }));
+      }
+    } catch (e) {}
+    try {
+      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+        ws.close(1000, 'client stop');
+      }
+    } catch (e) {}
+    state.closed = true;
+    state.active = false;
+  });
+  imageContinuousSockets = [];
+
+  if (imageGenerationExperimental && getImageRunMode() === 'continuous') {
+    setImageStatusText('Stopped');
+  } else {
+    setImageStatusText('Idle');
+  }
+  updateImageContinuousButtons();
+  updateImageContinuousStats();
+}
+
+function startImageContinuous() {
+  if (!imageGenerationExperimental || getImageRunMode() !== 'continuous') {
+    return;
+  }
+  const prompt = String(q('image-prompt')?.value || '').trim();
+  if (!prompt) {
+    showToast('Please input prompt', 'warning');
+    return;
+  }
+  if (!getUserApiKey()) {
+    showToast('Please input API key first', 'warning');
+    return;
+  }
+
+  const aspectRatio = String(q('image-aspect')?.value || '2:3').trim() || '2:3';
+  const concurrency = getImageContinuousConcurrency();
+  const token = imageContinuousRunToken + 1;
+  imageContinuousDesiredConcurrency = concurrency;
+
+  stopImageContinuous();
+  imageContinuousRunToken = token;
+  imageContinuousRunning = true;
+  clearImageContinuousError();
+  imageContinuousActive = 0;
+  if (!q('image-waterfall')?.children?.length) resetImageContinuousMetrics(true);
+
+  setImageStatusText('Connecting');
+  updateImageContinuousButtons();
+  updateImageContinuousStats();
+
+  for (let i = 0; i < concurrency; i += 1) {
+    openImageContinuousSocket(i, token, prompt, aspectRatio);
+  }
+}
+
+function isExperimentalImageMethod(method) {
+  const value = String(method || '').trim().toLowerCase();
+  return (
+    value === 'imagine_ws_experimental' ||
+    value === 'imagine_ws' ||
+    value === 'experimental' ||
+    value === 'new' ||
+    value === 'new_method'
+  );
+}
+
+async function refreshImageGenerationMethod() {
+  const headers = buildApiHeaders();
+  imageGenerationMethod = 'legacy';
+  imageGenerationExperimental = false;
+
+  if (!headers.Authorization) {
+    stopImageContinuous();
+    updateImageModeUI();
+    return;
+  }
+
+  try {
+    const res = await fetch(`/v1/images/method?t=${Date.now()}`, {
+      headers,
+      cache: 'no-store',
+    });
+    if (res.ok) {
+      const data = await res.json().catch(() => ({}));
+      const method = String(data?.image_generation_method || data?.method || '').trim().toLowerCase();
+      imageGenerationMethod = method || 'legacy';
+      imageGenerationExperimental = isExperimentalImageMethod(imageGenerationMethod);
+    }
+  } catch (e) {}
+
+  if (!imageGenerationExperimental) {
+    stopImageContinuous();
+  }
+
+  updateImageModeUI();
+}
+
 async function refreshModels() {
   const sel = q('model-select');
+  const previousValue = String(sel.value || '').trim();
   sel.innerHTML = '';
 
   const headers = buildApiHeaders();
@@ -273,23 +820,37 @@ async function refreshModels() {
 
     const filtered = models.filter((m) => {
       const id = String(m.id || '');
-      if (currentTab === 'image') return /imagine/i.test(id) && !/video/i.test(id);
-      if (currentTab === 'video') return /video/i.test(id);
+      if (currentTab === 'image') return id === 'grok-imagine-1.0';
+      if (currentTab === 'video') return id === 'grok-imagine-1.0-video';
       return !/imagine/i.test(id) || id === 'grok-4-heavy';
     });
 
+    const filteredIds = [];
     filtered.forEach((m) => {
       const opt = document.createElement('option');
       const id = String(m.id || '');
       const label = String(m.display_name || id);
+      filteredIds.push(id);
       opt.value = id;
       opt.textContent = `${label} (${id})`;
       sel.appendChild(opt);
     });
 
-    if (currentTab === 'image') sel.value = 'grok-imagine-1.0';
-    else if (currentTab === 'video') sel.value = 'grok-imagine-1.0-video';
-    else sel.value = sel.value || 'grok-4-fast';
+    if (currentTab === 'image') {
+      sel.value = filteredIds.includes('grok-imagine-1.0') ? 'grok-imagine-1.0' : (filteredIds[0] || '');
+      return;
+    }
+    if (currentTab === 'video') {
+      sel.value = filteredIds.includes('grok-imagine-1.0-video') ? 'grok-imagine-1.0-video' : (filteredIds[0] || '');
+      return;
+    }
+    if (previousValue && filteredIds.includes(previousValue)) {
+      sel.value = previousValue;
+    } else if (filteredIds.includes(PREFERRED_CHAT_MODEL)) {
+      sel.value = PREFERRED_CHAT_MODEL;
+    } else {
+      sel.value = filteredIds[0] || '';
+    }
   } catch (e) {
     showToast('加载模型失败: ' + (e?.message || e), 'error');
   }
@@ -298,24 +859,34 @@ async function refreshModels() {
 function saveApiKey() {
   const k = getUserApiKey();
   if (!k) return showToast('请输入 API Key', 'warning');
+  stopImageContinuous();
   localStorage.setItem(STORAGE_KEY, k);
   showToast('已保存', 'success');
   refreshModels();
+  refreshImageGenerationMethod();
 }
 
 function clearApiKey() {
+  stopImageContinuous();
   localStorage.removeItem(STORAGE_KEY);
   q('api-key-input').value = '';
+  imageGenerationMethod = 'legacy';
+  imageGenerationExperimental = false;
+  updateImageModeUI();
   showToast('已清除', 'success');
 }
 
 function switchTab(tab) {
+  if (currentTab === 'image' && tab !== 'image') {
+    stopImageContinuous();
+  }
   currentTab = tab;
   ['chat', 'image', 'video'].forEach((t) => {
     q(`tab-${t}`).classList.toggle('active', t === tab);
     q(`panel-${t}`).classList.toggle('hidden', t !== tab);
   });
   refreshModels();
+  if (tab === 'image') refreshImageGenerationMethod();
 }
 
 function pickChatImage() {
@@ -343,16 +914,58 @@ async function uploadImages(files) {
   return uploaded.filter(Boolean);
 }
 
+async function retryLastAssistantAnswer() {
+  if (chatSending) return showToast('请求进行中，请稍候重试', 'warning');
+
+  const lastUserIndex = findLastUserMessageIndex(chatMessages);
+  if (lastUserIndex < 0) return showToast('没有可重试的回答', 'warning');
+
+  const retryMessages = chatMessages.slice(0, lastUserIndex + 1);
+  const model = getSelectedChatModel();
+  if (!model) return showToast('当前没有可用聊天模型', 'error');
+
+  const stream = Boolean(q('stream-toggle').checked);
+  const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };
+  if (!headers.Authorization) return showToast('请先填写 API Key', 'warning');
+
+  const assistantBubble = showUserMsg('assistant', '');
+  setChatSendingState(true);
+  try {
+    const body = { model, messages: retryMessages, stream };
+    if (stream) {
+      const content = await streamChat(body, assistantBubble, false);
+      chatMessages = [...retryMessages, { role: 'assistant', content }];
+    } else {
+      const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify(body) });
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 401) throw new Error('API Key 无效或未授权');
+      if (!res.ok) throw new Error(data?.error?.message || data?.detail || `HTTP ${res.status}`);
+      const content = String(data?.choices?.[0]?.message?.content || '');
+      renderContent(assistantBubble, content, false);
+      chatMessages = [...retryMessages, { role: 'assistant', content }];
+    }
+    attachAssistantRetryAction(assistantBubble);
+  } catch (e) {
+    showToast('重试失败: ' + (e?.message || e), 'error');
+  } finally {
+    setChatSendingState(false);
+  }
+}
+
 async function sendChat() {
+  if (chatSending) return showToast('请求进行中，请稍候重试', 'warning');
+
   const prompt = String(q('chat-input').value || '').trim();
   if (!prompt && !chatAttachments.length) return showToast('请输入内容或上传图片', 'warning');
 
-  const model = String(q('model-select').value || '').trim();
+  const model = getSelectedChatModel();
+  if (!model) return showToast('当前没有可用聊天模型', 'error');
   const stream = Boolean(q('stream-toggle').checked);
 
   const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };
   if (!headers.Authorization) return showToast('请先填写 API Key', 'warning');
 
+  setChatSendingState(true);
   try {
     let imgUrls = [];
     if (chatAttachments.length) {
@@ -379,20 +992,25 @@ async function sendChat() {
     if (stream) {
       const assistantBubble = showUserMsg('assistant', '');
       await streamChat(body, assistantBubble);
+      attachAssistantRetryAction(assistantBubble);
     } else {
       const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify(body) });
-      if (res.status === 401) return showToast('API Key 无效或未授权', 'error');
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
+      if (res.status === 401) throw new Error('API Key 无效或未授权');
+      if (!res.ok) throw new Error(data?.error?.message || data?.detail || `HTTP ${res.status}`);
       const content = data?.choices?.[0]?.message?.content || '';
       chatMessages.push({ role: 'assistant', content });
-      showUserMsg('assistant', content);
+      const assistantBubble = showUserMsg('assistant', content);
+      attachAssistantRetryAction(assistantBubble);
     }
   } catch (e) {
     showToast('发送失败: ' + (e?.message || e), 'error');
+  } finally {
+    setChatSendingState(false);
   }
 }
 
-async function streamChat(body, bubbleEl) {
+async function streamChat(body, bubbleEl, commitHistory = true) {
   const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };
   const res = await fetch('/v1/chat/completions', { method: 'POST', headers, body: JSON.stringify(body) });
   if (!res.ok || !res.body) {
@@ -416,8 +1034,8 @@ async function streamChat(body, bubbleEl) {
       if (!line.startsWith('data:')) continue;
       const payload = line.slice(5).trim();
       if (payload === '[DONE]') {
-        chatMessages.push({ role: 'assistant', content: acc });
-        return;
+        if (commitHistory) chatMessages.push({ role: 'assistant', content: acc });
+        return acc;
       }
       try {
         const obj = JSON.parse(payload);
@@ -431,43 +1049,207 @@ async function streamChat(body, bubbleEl) {
     }
   }
 
-  chatMessages.push({ role: 'assistant', content: acc });
+  if (commitHistory) chatMessages.push({ role: 'assistant', content: acc });
+  return acc;
+}
+
+function createImageCard(index) {
+  const card = document.createElement('div');
+  card.className = 'result-card';
+  card.dataset.index = String(index);
+  card.innerHTML = `
+    <div class="result-placeholder">等待生成...</div>
+    <div class="result-progress"><div class="result-progress-bar"></div></div>
+    <div class="result-meta"><span>#${index + 1}</span><span class="result-status">0%</span></div>
+  `;
+  return card;
+}
+
+function ensureImageCard(cardMap, index) {
+  const key = Number(index) || 0;
+  if (cardMap.has(key)) return cardMap.get(key);
+  const card = createImageCard(key);
+  q('image-results').appendChild(card);
+  cardMap.set(key, card);
+  return card;
+}
+
+function updateImageCardProgress(card, progress) {
+  const pct = Math.max(0, Math.min(100, Number(progress) || 0));
+  const bar = card.querySelector('.result-progress-bar');
+  const status = card.querySelector('.result-status');
+  if (bar) bar.style.width = `${pct}%`;
+  if (status) status.textContent = `${pct}%`;
+}
+
+function updateImageCardCompleted(card, src, failed) {
+  const placeholder = card.querySelector('.result-placeholder');
+  const progress = card.querySelector('.result-progress');
+  const status = card.querySelector('.result-status');
+
+  if (progress) progress.remove();
+
+  if (failed) {
+    card.classList.add('is-error');
+    if (placeholder) placeholder.textContent = '生成失败';
+    if (status) status.textContent = '失败';
+    return;
+  }
+
+  card.classList.remove('is-error');
+  if (placeholder) placeholder.remove();
+
+  const img = document.createElement('img');
+  img.alt = 'image';
+  img.src = src;
+  bindRetryableImage(img);
+  card.insertBefore(img, card.firstChild);
+
+  if (status) status.textContent = '完成';
+}
+
+function buildImageRequestConfig() {
+  const ratio = String(q('image-aspect')?.value || '2:3');
+  const concurrency = Math.max(1, Math.min(3, Math.floor(Number(q('image-concurrency')?.value || 1) || 1)));
+  if (!imageGenerationExperimental) {
+    return { size: '1024x1024', concurrency: 1 };
+  }
+  return { size: ratio, concurrency };
+}
+
+async function streamImage(body, headers) {
+  const res = await fetch('/v1/images/generations', {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({ ...body, stream: true }),
+  });
+
+  if (!res.ok || !res.body) {
+    const t = await res.text().catch(() => '');
+    throw new Error(`HTTP ${res.status}: ${t.slice(0, 200)}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  const cardMap = new Map();
+  const completedSet = new Set();
+  let rendered = 0;
+  let buf = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buf += decoder.decode(value, { stream: true });
+    const blocks = buf.split('\n\n');
+    buf = blocks.pop() || '';
+
+    for (const block of blocks) {
+      const lines = block.split('\n').map((line) => line.trim()).filter(Boolean);
+      if (!lines.length) continue;
+
+      let event = '';
+      const dataLines = [];
+      lines.forEach((line) => {
+        if (line.startsWith('event:')) event = line.slice(6).trim();
+        if (line.startsWith('data:')) dataLines.push(line.slice(5).trim());
+      });
+
+      const payload = dataLines.join('\n').trim();
+      if (!payload) continue;
+      if (payload === '[DONE]') return rendered;
+
+      let obj = null;
+      try {
+        obj = JSON.parse(payload);
+      } catch (e) {
+        continue;
+      }
+
+      const type = String(obj?.type || event || '').trim();
+      const idx = Math.max(0, Number(obj?.index) || 0);
+      const card = ensureImageCard(cardMap, idx);
+
+      if (type === 'image_generation.partial_image') {
+        updateImageCardProgress(card, obj?.progress ?? 0);
+        continue;
+      }
+
+      if (type === 'image_generation.completed') {
+        const src = pickImageSrc(obj);
+        const failed = !src;
+        updateImageCardCompleted(card, src, failed);
+        if (!failed && !completedSet.has(idx)) {
+          completedSet.add(idx);
+          rendered += 1;
+        }
+      }
+    }
+  }
+
+  return rendered;
 }
 
 async function generateImage() {
   const prompt = String(q('image-prompt').value || '').trim();
   if (!prompt) return showToast('请输入 prompt', 'warning');
-  const model = String(q('model-select').value || 'grok-imagine-1.0').trim();
-  const n = Math.max(1, Math.min(10, Math.floor(Number(q('image-n').value || 1) || 1)));
 
   const headers = { ...buildApiHeaders(), 'Content-Type': 'application/json' };
   if (!headers.Authorization) return showToast('请先填写 API Key', 'warning');
 
+  if (imageGenerationExperimental && getImageRunMode() === 'continuous') {
+    startImageContinuous();
+    return;
+  }
+
+  stopImageContinuous();
+
+  const model = String(q('model-select').value || 'grok-imagine-1.0').trim();
+  const n = Math.max(1, Math.min(10, Math.floor(Number(q('image-n').value || 1) || 1)));
+  const stream = Boolean(q('stream-toggle').checked);
+  const useStream = stream && n <= 2;
+  const { size, concurrency } = buildImageRequestConfig();
+
   q('image-results').innerHTML = '';
   showToast('生成中...', 'info');
+
+  const reqBody = { prompt, model, n, size, concurrency };
   try {
+    if (stream && !useStream) {
+      showToast('n > 2 disables stream and falls back to non-stream mode.', 'warning');
+    }
+
+    if (useStream) {
+      const rendered = await streamImage(reqBody, headers);
+      if (!rendered) throw new Error('No image generated');
+      return;
+    }
+
     const res = await fetch('/v1/images/generations', {
       method: 'POST',
       headers,
-      body: JSON.stringify({ prompt, model, n }),
+      body: JSON.stringify({ ...reqBody, stream: false }),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) throw new Error(data?.error?.message || data?.detail || `HTTP ${res.status}`);
 
     const items = Array.isArray(data?.data) ? data.data : [];
-    if (!items.length) throw new Error('没有生成结果');
+    if (!items.length) throw new Error('No image generated');
 
     let rendered = 0;
-    items.forEach((it) => {
-      const url = pickImageSrc(it);
-      if (!url) return;
-      rendered += 1;
-      const card = document.createElement('div');
-      card.className = 'result-card';
-      card.innerHTML = `<img src="${escapeHtml(url)}" alt="image" />`;
+    items.forEach((it, idx) => {
+      const src = pickImageSrc(it);
+      const card = createImageCard(idx);
       q('image-results').appendChild(card);
+      if (!src) {
+        updateImageCardCompleted(card, '', true);
+        return;
+      }
+      rendered += 1;
+      updateImageCardCompleted(card, src, false);
     });
-    if (!rendered) throw new Error('图片返回为空或格式不支持');
+
+    if (!rendered) throw new Error('Image data is empty or unsupported');
   } catch (e) {
     showToast('生图失败: ' + (e?.message || e), 'error');
   }
@@ -566,3 +1348,4 @@ if (document.readyState === 'loading') {
 } else {
   init();
 }
+

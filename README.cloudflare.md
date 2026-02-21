@@ -11,6 +11,8 @@
 - **KV**：缓存 `/images/*` 的图片/视频资源（从 `assets.grok.com` 代理抓取）
 - **每天 0 点统一清除**：通过 KV `expiration` + Workers Cron 定时清理元数据（`wrangler.toml` 已配置，默认按北京时间 00:00）
 - **前端移动端适配一致生效**：Workers 与 FastAPI/Docker 复用同一套 `/static/*` 资源，包含手机端抽屉导航、表格横向滚动、API Key 居中悬浮新增弹窗等交互
+- **模型集合与主 README 对齐**：严格移除旧模型名并同步新增模型（含 `grok-4.20-beta`）
+- **聊天重试能力一致生效**：`/chat` 与 `/admin/chat` 支持“重试上一条回答”与“图片加载失败点击重试”
 
 > 原 Python/FastAPI 版本仍保留用于本地/Docker；Cloudflare 部署请按本文件走 Worker 版本。
 
@@ -143,6 +145,19 @@ python scripts/smoke_test.py --base-url https://<你的域名或workers.dev>
 3. `wrangler d1 migrations apply DB --remote --config wrangler.ci.toml`
 4. `wrangler deploy`
 
+### 仓库级部署自检（建议）
+
+在触发一键部署前，可先在仓库根目录运行：
+
+```bash
+uv run pytest -q
+npm run typecheck
+python scripts/check_model_catalog_sync.py
+npx wrangler deploy --dry-run --config wrangler.toml
+docker compose -f docker-compose.yml config
+docker compose -f docker-compose.yml -f docker-compose.build.yml config
+```
+
 触发策略保持不变：
 - `push` 到 `main`：自动触发 Cloudflare 部署作业
 - `workflow_dispatch`：可手动选择 `cloudflare/docker/both`
@@ -193,27 +208,22 @@ python scripts/smoke_test.py --base-url https://<你的域名或workers.dev>
 
 ## 8) 接口
 
-- `POST /v1/chat/completions`（支持 `stream: true`）
-- `GET /v1/models`
-- `GET /images/<img_path>`：从 KV 读缓存，未命中则抓取 `assets.grok.com` 并写入 KV（并在每天 0 点过期/清除）
-- 注意：KV 单条数据有大小限制（建议 ≤ 25MB），且大多数视频播放器会发起 Range 请求；Range 场景会直接代理上游，不一定会命中 KV 缓存。
-- 管理后台 API：`/api/*`（用于管理页）
+- POST /v1/chat/completions (supports stream: true)
+- GET /v1/models (model set aligns with `readme.md`, including latest additions/removals)
+- GET /v1/images/method: returns current image-generation mode (legacy or imagine_ws_experimental) for /chat and /admin/chat UI switching
+- POST /v1/images/generations: experimental mode supports size (aspect-ratio mapping) and concurrency (1..3)
+- POST /v1/images/edits: only accepts grok-imagine-1.0-edit
+- GET /images/<img_path>: reads from KV cache; on miss fetches assets.grok.com and writes back to KV (daily expiry/cleanup policy)
+- Note: Workers KV single-value size is limited (recommended <= 25MB); most video players use Range requests, which may bypass KV hits
+- Admin APIs: /api/*
 
 ### 8.1) 管理后台 API 兼容语义（与 FastAPI 一致）
 
-- `GET /api/v1/admin/tokens` 返回项新增（增量兼容）：
-  - `token_type`
-  - `quota_known`
-  - `heavy_quota`
-  - `heavy_quota_known`
-- `POST /api/v1/admin/keys/update`：
-  - 当 key 不存在时返回 `404`
-- 额度语义：
-  - `remaining_queries = -1` 表示额度未知（unknown quota semantics）
-  - 前端应结合 `quota_known` / `heavy_quota_known` 判断，不应将未知额度直接判定为“额度用尽”
+- GET /api/v1/admin/tokens adds fields (compatible): token_type, quota_known, heavy_quota, heavy_quota_known
+- POST /api/v1/admin/keys/update returns 404 when key does not exist
+- Quota semantics: remaining_queries = -1 means unknown quota; frontend should use quota_known / heavy_quota_known for judgement
 
 ---
-
 ## 9) 部署到 Pages（可选，但不推荐用于“定时清理”）
 
 仓库已提供 Pages Advanced Mode 入口：
